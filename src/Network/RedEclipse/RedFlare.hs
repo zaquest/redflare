@@ -1,5 +1,4 @@
-{-|
-  This library provides functions and datatypes for getting information
+{-| This library provides functions and datatypes for getting information
   about Red Eclipse's game servers.
  -}
 {-# LANGUAGE RecordWildCards #-}
@@ -21,13 +20,14 @@ module Network.RedEclipse.RedFlare
                 ,PortNumber) where
 
 import Control.Exception (bracket)
-import Control.Monad (replicateM, filterM)
-import Control.Monad.State (State, runState, evalState, put, get)
+import Control.Monad (replicateM, filterM, unless, when)
+import Control.Monad.State (State, runState, evalState, put, get, modify)
 import Data.Binary.Get
-import Data.Bits ((.&.), shift, Bits)
+import Data.Bits (Bits, testBit, clearBit, zeroBits)
 import Data.Either (rights, either)
-import Data.List (isPrefixOf, dropWhileEnd)
-import Data.Maybe (mapMaybe, maybe, fromJust, fromMaybe)
+import Data.List (isPrefixOf, dropWhileEnd, foldl1')
+import Data.Maybe (mapMaybe, maybe, fromJust, isNothing)
+import Data.Monoid ((<>))
 import Data.Tuple (swap)
 import Data.Word (Word8)
 import Network.Socket hiding (recv)
@@ -38,6 +38,8 @@ import qualified Data.ByteString.Lazy as LW
 import qualified Data.Vector as V
 import Data.Aeson (ToJSON(..))
 import Data.Aeson.TH (deriveToJSON, defaultOptions, Options(..))
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (Concurrently(..), race, mapConcurrently)
 
 -- * Red Flare
 
@@ -49,7 +51,7 @@ serverQuery host port = withSocket host (port+1) Datagram (((>>= parseReport) <$
     recvReport Nothing = return (Left ("Can't connect to " ++ host ++ ":" ++ show port))
     recvReport (Just sock) = do
       sendAll sock (W.pack ping) -- ping id
-      Right <$> recv sock enetMaxMTU
+      maybe (Left "Timed out on receiving report") Right <$> recvTimeout 10000000 sock enetMaxMTU
     parseReport reportBS =
       case runGetOrFail (skip (length ping) >> getREServerReport) (LW.fromStrict reportBS) of
         Left (_, _, err) -> Left err
@@ -64,7 +66,15 @@ serversList host port = parseServersCfg <$> withSocket host port Stream getServe
     getServersCfg Nothing = fail ("Can't connect " ++ host ++ ":" ++ show port)
     getServersCfg (Just sock) = do
       sendAll sock (C.pack "update\n")
-      recv sock enetMaxMTU
+      recvAll sock
+    recvAll :: Socket -> IO W.ByteString
+    recvAll sock = do
+      mchunk <- recvTimeout 10000000 sock enetMaxMTU
+      case mchunk of
+        Nothing -> fail "Timed out on receiving servers list"
+        Just chunk -> if W.length chunk > 0
+                        then (chunk <>) <$> recvAll sock
+                        else return W.empty
     parseServersCfg = mapMaybe parseAddServer . filter isAddServer . lines . C.unpack
     parseAddServer line =
       case drop 1 (words line) of
@@ -86,7 +96,7 @@ serversList host port = parseServersCfg <$> withSocket host port Stream getServe
 redFlare :: HostName -> PortNumber -> IO [((HostName, PortNumber), Either String ServerReport)]
 redFlare host port = do
   servers <- serversList host port
-  zip servers <$> mapM (uncurry serverQuery) servers
+  zip servers <$> mapConcurrently (uncurry serverQuery) servers
 
 -- | Red Eclipse uses enet library. Enet transfers data in UDP packets
 -- of length no more than 4096.
@@ -240,7 +250,8 @@ data Mode = Demo | Edit | Deathmatch | Capture | Defend | Bomber | Race | Gauntl
   deriving (Show, Eq, Ord, Enum, Read, Bounded)
 
 -- | Parse game mode.
--- TODO: version is ignored
+-- Currently the version is not needed. The only caveat of ignoring version
+-- is that in case of an error there might appear `Gauntlet` in 1.5 protocol.
 getREMode :: Version -> Get Mode
 getREMode _ = getREEnum "game mode"
 
@@ -251,102 +262,38 @@ data Mutator = Multi   | FFA       | Coop        | Insta     | Medieval
              | Hard    | Basic     | Quick       | MutDefend | Protect
              | King    | Hold      | Basket      | Touchdown | Attack
              | Timed   | Endurance | MutGauntlet
-  deriving (Show, Read)
+  deriving (Show, Read, Eq)
 
--- | Version specific enums for mutators.
--- GSP{1,2,3} are game mode specific mutators, e.g. timed for race
-data Mutator14 = M14Multi   | M14FFA     | M14Coop     | M14Insta   | M14Medieval
-               | M14Kaboom  | M14Duel    | M14Survivor | M14Classic | M14OnSlaught
-               | M14Jetpack | M14Vampire | M14Expert   | M14Resize  | M14GSP1
-               | M14GSP2    | M14GSP3
-  deriving (Show, Read, Enum, Eq, Ord, Bounded)
+-- | Returns a list of available mutators for the given version and game mode.
+-- Mutators are ordered in Red Eclipse's enum order. If n-th mutator
+-- in Red Eclipse's order is not available in given mode and version
+-- then `Nothing` is put in on n-th position in output list.
+verModeMuts :: Version -> Mode -> [Maybe Mutator]
+verModeMuts V220 Edit       = [FFA, Classic, Jetpack] `from` allMuts V220
+verModeMuts v    Edit       = [FFA, Classic, Freestyle] `from` allMuts v
+verModeMuts v    Deathmatch = allow (allMuts v)
+verModeMuts v    Capture    = allMuts v `but` [FFA] ++ allow [Quick, MutDefend, Protect]
+verModeMuts v    Defend     = allMuts v `but` [FFA, Duel, Survivor] ++ allow [Quick, King]
+verModeMuts V220 Bomber     = allMuts V220 `but` [FFA] ++ allow [Hold, Touchdown]
+verModeMuts v    Bomber     = allMuts v `but` [FFA] ++ allow [Hold, Basket, Attack]
+verModeMuts V220 Race       = allMuts V220 `but` [Multi, Coop, Duel, Survivor]
+verModeMuts v    Race       = [Multi, FFA, OnSlaught, Freestyle] `from` allMuts v ++ allow [Timed, Endurance, MutGauntlet]
+verModeMuts V220 Gauntlet   = allMuts V220 `but` [Multi, FFA, Coop, Survivor] ++ allow [Timed, Hard]
+verModeMuts _    Gauntlet   = []
 
-data Mutator15 = M15Multi     | M15FFA     | M15Coop     | M15Insta   | M15Medieval
-               | M15Kaboom    | M15Duel    | M15Survivor | M15Classic | M15OnSlaught
-               | M15Freestyle | M15Vampire | M15Resize   | M15Hard    | M15Basic
-               | M15GSP1      | M15GSP2    | M15GSP3
-  deriving (Show, Read, Enum, Eq, Ord, Bounded)
-
--- `unsafeMut14ToMut` and `unsafeMut15ToMut` do not check mode
--- and can not handle game mode specific mutators
--- these are just convenience functions to be used in
--- `mut14ToMut` and `mut15ToMut` functions
-
-unsafeMutToMut :: forall a. (Enum a, Bounded a, Eq a, Show a) => String -> [Mutator] -> a -> Mutator
-unsafeMutToMut name muts mut =
-  fromMaybe
-    (error (name ++ ": can not handle " ++ show mut ++ " mutator"))
-    (lookup mut (zip (enumFrom minBound) muts))
-
-unsafeMut14ToMut :: Mutator14 -> Mutator
-unsafeMut14ToMut = unsafeMutToMut "unsafeMut14ToMut"
-  [Multi, FFA, Coop, Insta, Medieval, Kaboom, Duel, Survivor, Classic,
-   OnSlaught, Jetpack, Vampire, Expert, Resize]
-
-unsafeMut15ToMut :: Mutator15 -> Mutator
-unsafeMut15ToMut = unsafeMutToMut "unsafeMut15ToMut"
-  [Multi, FFA, Coop, Insta, Medieval, Kaboom, Duel, Survivor, Classic,
-   OnSlaught, Freestyle, Vampire, Resize, Hard, Basic]
-
-mut14ToMut :: Mode -> Mutator14 -> Either String Mutator
-mut14ToMut Edit       mut | mut `elem` [M14FFA, M14Classic, M14Jetpack]
-                              = Right (unsafeMut14ToMut mut)
-mut14ToMut Deathmatch mut | mut `notElem` [M14GSP1, M14GSP2, M14GSP3]
-                              = Right (unsafeMut14ToMut mut)
-mut14ToMut Capture    M14GSP1 = Right Quick
-mut14ToMut Capture    M14GSP2 = Right MutDefend
-mut14ToMut Capture    M14GSP3 = Right Protect
-mut14ToMut Capture    mut | mut /= M14FFA
-                              = Right (unsafeMut14ToMut mut)
-mut14ToMut Defend     M14GSP1 = Right Quick
-mut14ToMut Defend     M14GSP2 = Right King
-mut14ToMut Defend     mut | mut `notElem` [M14FFA, M14Duel, M14Survivor, M14GSP3]
-                              = Right (unsafeMut14ToMut mut)
-mut14ToMut Bomber     M14GSP1 = Right Hold
-mut14ToMut Bomber     M14GSP2 = Right Touchdown
-mut14ToMut Bomber     mut | mut `notElem` [M14FFA, M14GSP3]
-                              = Right (unsafeMut14ToMut mut)
-mut14ToMut Race       mut | mut `notElem` [M14Multi, M14Coop, M14Duel, M14Survivor, M14GSP1, M14GSP2, M14GSP3]
-                              = Right (unsafeMut14ToMut mut)
-mut14ToMut Gauntlet   M14GSP1 = Right Timed
-mut14ToMut Gauntlet   M14GSP2 = Right Hard
-mut14ToMut Gauntlet   mut | mut `notElem` [M14Multi, M14FFA, M14Coop, M14Survivor, M14GSP3]
-                              = Right (unsafeMut14ToMut mut)
-mut14ToMut mode       mut     = Left ("mut14ToMut: There's no " ++ show mut ++ " mutator for " ++ show mode ++ " mode in Red Eclipse 1.4")
-
-mut15ToMut :: Mode -> Mutator15 -> Either String Mutator
-mut15ToMut Edit       mut | mut `elem` [M15FFA, M15Classic, M15Freestyle]
-                              = Right (unsafeMut15ToMut mut)
-mut15ToMut Deathmatch mut | mut `notElem` [M15GSP1, M15GSP2, M15GSP3]
-                              = Right (unsafeMut15ToMut mut)
-mut15ToMut Capture    M15GSP1 = Right Quick
-mut15ToMut Capture    M15GSP2 = Right MutDefend
-mut15ToMut Capture    M15GSP3 = Right Protect
-mut15ToMut Capture    mut | mut /= M15FFA
-                              = Right (unsafeMut15ToMut mut)
-mut15ToMut Defend     M15GSP1 = Right Quick
-mut15ToMut Defend     M15GSP2 = Right King
-mut15ToMut Defend     mut | mut `notElem` [M15FFA, M15Duel, M15Survivor, M15GSP3]
-                              = Right (unsafeMut15ToMut mut)
-mut15ToMut Bomber     M15GSP1 = Right Hold
-mut15ToMut Bomber     M15GSP2 = Right Basket
-mut15ToMut Bomber     M15GSP3 = Right Attack
-mut15ToMut Bomber     mut | mut /= M15FFA
-                              = Right (unsafeMut15ToMut mut)
-mut15ToMut Race       M15GSP1 = Right Timed
-mut15ToMut Race       M15GSP2 = Right Endurance
-mut15ToMut Race       M15GSP3 = Right MutGauntlet
-mut15ToMut Race       mut | mut `elem` [M15Multi, M15FFA, M15OnSlaught, M15Freestyle]
-                              = Right (unsafeMut15ToMut mut)
-mut15ToMut mode       mut     = Left ("mut15ToMut: There's no " ++ show mut ++ " mutator for " ++ show mode ++ " mode in Red Eclipse 1.5")
+allMuts V220 = [Multi, FFA, Coop, Insta, Medieval, Kaboom, Duel, Survivor, Classic, OnSlaught, Jetpack, Vampire, Expert, Resize]
+allMuts _    = [Multi, FFA, Coop, Insta, Medieval, Kaboom, Duel, Survivor, Classic, OnSlaught, Freestyle, Vampire, Resize, Hard, Basic]
+ys `from` xs = map (\x -> if x `elem` ys then Just x else Nothing) xs
+xs `but`  ys = map (\x -> if x `elem` ys then Nothing else Just x) xs
+allow = map Just
 
 getREMutators :: Version -> Mode -> Get [Mutator]
 getREMutators version mode = do
   num <- getREInt
-  let emuts = case version of
-                V220 -> bitsToEnum num >>= mapM (mut14ToMut mode)
-                _    -> bitsToEnum num >>= mapM (mut15ToMut mode)
-  either fail return emuts
+  let emuts = bitsToList (verModeMuts version mode) num
+  either (fail' num) return emuts
+  where
+    fail' num _ = fail ("Malformed mutator code " ++ show num ++ " for " ++ show mode ++ " in protocol " ++ show version)
 
 -- | Master mode.
 data MasterMode = Open | Veto | Locked | Private | Password
@@ -356,29 +303,24 @@ data MasterMode = Open | Veto | Locked | Private | Password
 getREMasterMode :: Get MasterMode
 getREMasterMode = getREEnum "master mode"
 
--- | Datatype to represent game state. This type is also enum used for
--- parsing `V227` game state. `V226` game state is converted to this type.
--- `V220` does not support game state.
+-- | Datatype to represent game state.
 data GameState = Waiting | GetMap | SendMap | Readying | GameInfo | Playing | Overtime | Intermission | Voting
   deriving (Show, Read, Enum, Bounded)
-
--- | Game state for V226, which is a proper subset of game state for V227.
-data GameStateV226 = GSV226Waiting | GSV226Voting | GSV226Intermission | GSV226Playing | GSV226Overtime
-  deriving (Show, Read, Enum, Bounded)
-
--- | Convert V226 game state to game state.
-gameStateV226ToGameState :: GameStateV226 -> GameState
-gameStateV226ToGameState GSV226Waiting      = Waiting
-gameStateV226ToGameState GSV226Voting       = Voting
-gameStateV226ToGameState GSV226Intermission = Intermission
-gameStateV226ToGameState GSV226Playing      = Playing
-gameStateV226ToGameState GSV226Overtime     = Overtime
 
 -- | Parse game state.
 getREGameState :: Version -> Get GameState
 getREGameState V220 = fail "V220 does not support game state"
-getREGameState V226 = gameStateV226ToGameState <$> getREEnum "game state V226"
-getREGameState V227 = getREEnum "game state"
+getREGameState v = do
+  idx <- getREInt
+  when (idx < 0) (fail' idx)
+  case drop idx states of
+    (gs:_) -> return gs
+    []     -> fail' idx
+  where
+    states = case v of
+               V226 -> [Waiting, Voting, Intermission, Playing, Overtime]
+               V227 -> enumFrom Waiting
+    fail' idx = fail ("Bad game state " ++ show idx ++ " in protocol version " ++ show v)
 
 -- | Parse server's report.
 getREServerReport :: Get ServerReport
@@ -413,7 +355,7 @@ getREServerReport = do
 
 -- | A function to connect to server on specified host and port using
 -- specified socket type. If connection failed function argument is
--- `Nothing` otherwise it's `(Just socket)`
+-- `Nothing` otherwise it's `(Just socket)`.
 withSocket :: HostName -> PortNumber -> SocketType -> (Maybe Socket -> IO a) -> IO a
 withSocket host port sockType = bracket conn (maybe (return ()) sClose)
   where
@@ -429,29 +371,29 @@ withSocket host port sockType = bracket conn (maybe (return ()) sClose)
           return (Just sock)
         _ -> return Nothing
 
--- | Function to split bitfield of type `b` into enum type `a`. Returns
--- `Left err` if bitfield contained any bits that do not represent
--- one of enum values. If `i`-th bit of bitfied is set to `1` function
--- adds to output list value `toEnum i`. `Enum` instance for type `b`
--- must implement `enumFrom`.
-bitsToEnum :: forall a b. (Enum a, Bounded a, Ord b, Num b, Bits b, Show b) => b -> Either String [a]
-bitsToEnum num = if leftover > 0
-                   then Left ("Malformed enum code " ++ show num)
-                   else Right (map snd muts)
+-- | Splits bitfield of type `b` into a list of values `[a]`.
+-- Input list `[Maybe a]` is interpreted in the following way: if
+-- n-th value in a list is `Nothing` then n-th bit in the bitfield must
+-- be `0` else fail. `Just` values are unwrapped. If n-th bit is set
+-- in the bitfield and the length of the input list is `<= n` then fail.
+bitsToList :: Bits b => [Maybe a] -> b -> Either String [a]
+bitsToList xs b = if leftover == zeroBits
+                    then Right (map (\(_, Just m, _) -> m) muts)
+                    else Left "Malformed enum code"
   where
-    enum = enumFrom minBound :: [a]
-    code = map ((1 `shift`) . fromEnum) enum
-    (muts, leftover) = runState (filterM removeCode (zip code enum)) num
-    removeCode :: (b, a) -> State b Bool
-    removeCode (c, m) = do
-      n <- get
-      if (n .&. c) > 0
-        then put (n - c) >> return True
-        else return False
+    (muts, leftover) = runState (filterM removeCode (zip3 (bits b) xs [0..])) b
+    removeCode (b, ma, n) = unless (isNothing ma) (modify (`clearBit` n)) >> return b
+
+-- | Returns a bits of `b` as a list of `Bool` values.
+bits :: Bits b => b -> [Bool]
+bits b = map (testBit b) [0..]
+
+recvTimeout :: Int -> Socket -> Int -> IO (Maybe W.ByteString)
+recvTimeout timeout sock len = race (threadDelay timeout) (recv sock len)
+  >>= either (const (return Nothing)) (return . Just)
 
 -- | ToJSON instances
 deriveToJSON defaultOptions { omitNothingFields = True } ''ServerReport
-deriveToJSON defaultOptions { omitNothingFields = True } ''Version
 deriveToJSON defaultOptions { omitNothingFields = True } ''VerInfo
 deriveToJSON defaultOptions { omitNothingFields = True } ''Mode
 deriveToJSON defaultOptions { omitNothingFields = True } ''MasterMode
@@ -465,3 +407,6 @@ instance ToJSON Mutator where
 
 instance ToJSON PortNumber where
   toJSON p = toJSON (fromIntegral p :: Int)
+
+instance ToJSON Version where
+  toJSON = toJSON . fromEnum

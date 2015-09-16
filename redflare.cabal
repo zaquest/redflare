@@ -65,6 +65,7 @@ library
                      , bytestring >=0.10 && <0.11
                      , vector >=0.10 && <0.11
                      , aeson >=0.8.0.2 && <0.10
+                     , async
 
   -- Directories containing source files.
   hs-source-dirs:      src
