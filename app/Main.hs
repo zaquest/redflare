@@ -45,9 +45,7 @@ main :: IO ()
 main = do
   args <- cmdArgs rfargs
   reports <- redFlare (masterServer args) (fromIntegral $ portNumber args)
-  let reports' = if showEmpty args
-                   then reports
-                   else filter (shouldShow args) reports
+  let reports' = filter (shouldShow args) reports
   LBS.putStrLn $ encode (map Report reports')
   where
     shouldShow (RFArgs { showEmpty = False })
