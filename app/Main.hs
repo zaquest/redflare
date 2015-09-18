@@ -1,12 +1,11 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE DeriveDataTypeable #-}
 module Main where
 
-import System.Console.CmdArgs
 import qualified Data.ByteString.Lazy.Char8 as LBS
 import Data.Text (Text)
 import Data.Word (Word16)
 import Data.Aeson (encode, ToJSON(..), object, (.=))
+import Options.Applicative
 import Network.RedEclipse.RedFlare
 
 newtype Report = Report ((HostName, PortNumber), Either String ServerReport)
@@ -23,34 +22,71 @@ instance ToJSON Report where
                          , "status" .= ("success" :: Text)
                          , "report" .= sr ]
 
-data RFArgs = RFArgs { masterServer :: HostName
-                     , portNumber :: Word16
-                     , showEmpty :: Bool
-                     , showErrors :: Bool }
-  deriving (Show, Data, Typeable)
+data RFArgs = Master MasterArgs
+            | Single SingleArgs
+
+data MasterArgs = MasterArgs { masterHost :: HostName
+                             , masterPort :: Word16
+                             , showEmpty  :: Bool
+                             , showFailed :: Bool }
+
+data SingleArgs = SingleArgs { singleHost :: HostName
+                             , singlePort :: Word16 }
+
+args :: ParserInfo RFArgs
+args =
+  info (helper <*> subparser
+         (command "master"
+           (info masterOptions
+             (progDesc "Receive list of connected servers from master server and poll them to get their current state."
+             <> fullDesc))
+       <> command "single"
+           (info singleOptions
+             (progDesc "Get current state of a specified server."
+               <> fullDesc))))
+       (fullDesc
+        <> progDesc "Get current state of Red Eclipse game servers."
+        <> header "redflare - Red Eclipse JSON command line server browser")
+  where
+    masterOptions :: Parser RFArgs
+    masterOptions = helper <*> (Master <$> (MasterArgs
+      <$> strArgument
+            (metavar "HOST" <> value "play.redeclipse.net" <> showDefault
+             <> help "Master server's host")
+      <*> argument auto
+            (metavar "PORT" <> value 28800 <> showDefault
+             <> help "Master server's port")
+      <*> switch
+            (long "show-empty" <> short 'e'
+             <> help "If passed output will include reports from empty servers")
+      <*> switch
+            (long "show-failed" <> short 'f'
+             <> help "If passed output will include errors for servers that redflare failed to recieve reports from")))
+    singleOptions :: Parser RFArgs
+    singleOptions = helper <*> (Single <$> (SingleArgs
+      <$> strArgument
+            (metavar "HOST"
+             <> help "Server's host.")
+      <*> argument auto
+            (metavar "PORT" <> value 28801 <> showDefault
+             <> help "Server's port.")))
 
 
-rfargs = RFArgs { masterServer = def &= argPos 0 &= opt ("play.redeclipse.net" :: String) &= typ "Host"
-                , portNumber = def &= argPos 1 &= opt (28800 :: Word16) &= typ "Port"
-                , showEmpty = def &= help "Show empty servers in output"
-                , showErrors = def &= help "Show servers that RedFlare failed to connect to" }
-           &= summary "RedFlare 0.1.0.0"
-           &= details ["Outputs Red Eclipse's servers report from a given master server in JSON."
-                      ,"Takes host and port of the master server."
-                      ,"Default host is \"play.redeclipse.net\"."
-                      ,"Default port is 28800."
-                      ,"These correspond to official Red Eclipse master server."]
-
-main :: IO ()
-main = do
-  args <- cmdArgs rfargs
-  reports <- redFlare (masterServer args) (fromIntegral $ portNumber args)
+run :: RFArgs -> IO ()
+run (Master args) = do
+  reports <- redFlare (masterHost args) (fromIntegral $ masterPort args)
   let reports' = filter (shouldShow args) reports
   LBS.putStrLn $ encode (map Report reports')
   where
-    shouldShow (RFArgs { showEmpty = False })
-               ((_, _), Right (ServerReport { playerCnt = 0 })) = False
-    shouldShow (RFArgs { showErrors = False })
-               ((_, _), Left _) = False
+    shouldShow (MasterArgs { showEmpty = False })
+                ((_, _), Right (ServerReport { playerCnt = 0 })) = False
+    shouldShow (MasterArgs { showFailed = False })
+                ((_, _), Left _) = False
     shouldShow _ _ = True
+run (Single (SingleArgs { singleHost = host , singlePort = port })) = do
+  let port' = fromIntegral port
+  report <- serverQuery host port'
+  LBS.putStrLn . encode $ Report ((host, port'), report)
 
+main :: IO ()
+main = execParser args >>= run
