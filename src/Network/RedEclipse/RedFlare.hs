@@ -20,7 +20,7 @@ module Network.RedEclipse.RedFlare
                 ,PortNumber) where
 
 import Control.Exception (bracket)
-import Control.Monad (replicateM, filterM, unless, when)
+import Control.Monad (replicateM, filterM, unless, when, zipWithM_)
 import Control.Monad.State (State, runState, evalState, put, get, modify)
 import Data.Binary.Get
 import Data.Bits (Bits, testBit, clearBit, zeroBits)
@@ -38,8 +38,9 @@ import qualified Data.ByteString.Lazy as LW
 import qualified Data.Vector as V
 import Data.Aeson (ToJSON(..))
 import Data.Aeson.TH (deriveToJSON, defaultOptions, Options(..))
-import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (Concurrently(..), race, mapConcurrently)
+import System.Timeout (timeout)
+import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
 
 -- * Red Flare
 
@@ -51,7 +52,7 @@ serverQuery host port = withSocket host (port+1) Datagram (((>>= parseReport) <$
     recvReport Nothing = return (Left ("Can't connect to " ++ host ++ ":" ++ show port))
     recvReport (Just sock) = do
       sendAll sock (W.pack ping) -- ping id
-      maybe (Left "Timed out on receiving report") Right <$> recvTimeout 10000000 sock enetMaxMTU
+      maybe (Left "Timed out on receiving report") Right <$> timeout 10000000 (recv sock enetMaxMTU)
     parseReport reportBS =
       case runGetOrFail (skip (length ping) >> getREServerReport) (LW.fromStrict reportBS) of
         Left (_, _, err) -> Left err
@@ -69,7 +70,7 @@ serversList host port = parseServersCfg <$> withSocket host port Stream getServe
       recvAll sock
     recvAll :: Socket -> IO W.ByteString
     recvAll sock = do
-      mchunk <- recvTimeout 10000000 sock enetMaxMTU
+      mchunk <- timeout 10000000 (recv sock enetMaxMTU)
       case mchunk of
         Nothing -> fail "Timed out on receiving servers list"
         Just chunk -> if W.length chunk > 0
@@ -388,9 +389,14 @@ bitsToList xs b = if leftover == zeroBits
 bits :: Bits b => b -> [Bool]
 bits b = map (testBit b) [0..]
 
-recvTimeout :: Int -> Socket -> Int -> IO (Maybe W.ByteString)
-recvTimeout timeout sock len = race (threadDelay timeout) (recv sock len)
-  >>= either (const (return Nothing)) (return . Just)
+mapConcurrently :: (a -> IO b) -> [a] -> IO [b]
+mapConcurrently f as = do
+  vars <- mapM (const newEmptyMVar) as
+  zipWithM_ inOwnThread vars as
+  collect vars
+  where
+    inOwnThread v a = forkIO $ f a >>= putMVar v
+    collect = mapM takeMVar
 
 -- | ToJSON instances
 deriveToJSON defaultOptions { omitNothingFields = True } ''ServerReport
