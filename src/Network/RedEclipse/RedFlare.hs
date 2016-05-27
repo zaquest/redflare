@@ -114,7 +114,7 @@ getREInt =  do
     _ -> return (fromIntegral w1)
 
 -- String functions
-data UncolorState = NoColor | ColorSeq | ColorParen | ColorBracket | ColorBlink Int
+data UncolorState = NoColor | ColorSeq | ColorBracket Char | ColorBlink Int
   deriving Eq
 
 -- | Strip Red Eclipse's color codes from string
@@ -123,10 +123,9 @@ uncolorString s = evalState (filterM dropColor s) NoColor
   where
     dropColor :: Char -> State UncolorState Bool
     dropColor '\f' = put ColorSeq >> return False
-    dropColor '[' = dropOn ColorSeq ColorBracket
-    dropColor ']' = dropOn ColorBracket NoColor
-    dropColor '(' = dropOn ColorSeq ColorParen
-    dropColor ')' = dropOn ColorParen NoColor
+    dropColor '[' = dropOn ColorSeq (ColorBracket ']')
+    dropColor '(' = dropOn ColorSeq (ColorBracket ')')
+    dropColor c | c `elem` "])" = dropOn (ColorBracket c) NoColor
     dropColor 'z' = dropOn ColorSeq (ColorBlink 2)
     dropColor x = do s <- get
                      case s of
@@ -178,11 +177,11 @@ getREEnum name = do
     else fail ("Unknown " ++ name ++ " " ++ show num)
 
 -- | Datatype to represent Red Eclipse's protocol version
-data Version = V220 | V226 | V227
+data Version = V220 | V226 | V229
   deriving (Show, Read, Eq, Ord)
 
 tableVersion :: [(Version, Int)]
-tableVersion = [(V220, 220), (V226, 226), (V227, 227)]
+tableVersion = [(V220, 220), (V226, 226), (V229, 229)]
 
 instance Enum Version where
   fromEnum = fromJust . flip lookup tableVersion
@@ -194,7 +193,7 @@ instance Enum Version where
 
 instance Bounded Version where
   minBound = V220
-  maxBound = V227
+  maxBound = V229
 
 -- | Parse protocol's version number.
 getREVersion :: Get Version
@@ -262,7 +261,7 @@ data Mutator = Multi   | FFA       | Coop        | Insta     | Medieval
              | Jetpack | Freestyle | Vampire     | Expert    | Resize
              | Hard    | Basic     | Quick       | MutDefend | Protect
              | King    | Hold      | Basket      | Touchdown | Attack
-             | Timed   | Endurance | MutGauntlet
+             | Timed   | Endurance | MutGauntlet | Gladiator | OldSchool
   deriving (Show, Read, Eq)
 
 -- | Returns a list of available mutators for the given version and game mode.
@@ -272,6 +271,7 @@ data Mutator = Multi   | FFA       | Coop        | Insta     | Medieval
 verModeMuts :: Version -> Mode -> [Maybe Mutator]
 verModeMuts V220 Edit       = [FFA, Classic, Jetpack] `from` allMuts V220
 verModeMuts v    Edit       = [FFA, Classic, Freestyle] `from` allMuts v
+verModeMuts V229 Deathmatch = allow $ allMuts V229 ++ [Gladiator, OldSchool]
 verModeMuts v    Deathmatch = allow (allMuts v)
 verModeMuts v    Capture    = allMuts v `but` [FFA] ++ allow [Quick, MutDefend, Protect]
 verModeMuts v    Defend     = allMuts v `but` [FFA, Duel, Survivor] ++ allow [Quick, King]
@@ -319,8 +319,9 @@ getREGameState v = do
     []     -> fail' idx
   where
     states = case v of
+               V220 -> error ("Unsupported protocol version " ++ show v)
                V226 -> [Waiting, Voting, Intermission, Playing, Overtime]
-               V227 -> enumFrom Waiting
+               V229 -> enumFrom Waiting
     fail' idx = fail ("Bad game state " ++ show idx ++ " in protocol version " ++ show v)
 
 -- | Parse server's report.
@@ -344,8 +345,9 @@ getREServerReport = do
   mapName <- getREString
   serverDesc <- uncolorString <$> getREString
   verBranch <- case version of
-    V227 -> Just <$> getREString
-    _ -> return Nothing
+    V220 -> return Nothing
+    V226 -> return Nothing
+    V229 -> Just <$> getREString
   playerNames <- map uncolorString <$> replicateM playerCnt getREString
   handles <- case version of
     V220 -> return Nothing
