@@ -1,5 +1,4 @@
-cabal.sandbox.config
-.cabal-sandbox
+.stack-work
 dist/
 doc/
 *.o

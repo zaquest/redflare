@@ -58,13 +58,13 @@ library
   --other-extensions:    RecordWildCards, ScopedTypeVariables
 
   -- Other library packages from which modules are imported.
-  build-depends:       base >=4.8 && <4.9
-                     , mtl >=2.2 && <2.3
-                     , binary >=0.7 && <0.8
-                     , network >=2.6 && <2.7
-                     , bytestring >=0.10 && <0.11
-                     , vector >=0.10 && <0.11
-                     , aeson >=0.8.0.2 && <0.10
+  build-depends:       base >=4.8
+                     , mtl >=2.2
+                     , binary >=0.7
+                     , network >=2.6
+                     , bytestring >=0.10
+                     , vector >=0.10
+                     , aeson >=0.8.0.2
 
   -- Directories containing source files.
   hs-source-dirs:      src
@@ -79,7 +79,7 @@ executable redflare
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N
   build-depends:       base
                      , redflare
-                     , aeson >=0.8.0.2 && <0.10
+                     , aeson >=0.8.0.2
                      , text
                      , bytestring
                      , optparse-applicative
