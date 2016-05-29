@@ -8,17 +8,17 @@ import Data.Aeson (encode, ToJSON(..), object, (.=))
 import Options.Applicative
 import Network.RedEclipse.RedFlare
 
-newtype Report = Report ((HostName, PortNumber), Either String ServerReport)
+newtype Report = Report (Address, Either String ServerReport)
 
 instance ToJSON Report where
-  toJSON (Report ((host, port), report)) =
+  toJSON (Report (addr, report)) =
     case report of
-      Left err -> object [ "host"    .= host
-                         , "port"    .= port
+      Left err -> object [ "host"    .= host addr
+                         , "port"    .= port addr
                          , "status"  .= ("error" :: Text)
                          , "message" .= err ]
-      Right sr -> object [ "host"   .= host
-                         , "port"   .= port
+      Right sr -> object [ "host"   .= host addr
+                         , "port"   .= port addr
                          , "status" .= ("success" :: Text)
                          , "report" .= sr ]
 
@@ -74,19 +74,19 @@ args =
 
 run :: RFArgs -> IO ()
 run (Master args) = do
-  reports <- redFlare (masterHost args) (fromIntegral $ masterPort args)
+  reports <- redFlare (IP (masterHost args) (fromIntegral $ masterPort args))
   let reports' = filter (shouldShow args) reports
   LBS.putStrLn $ encode (map Report reports')
   where
-    shouldShow (MasterArgs { showEmpty = False })
-                ((_, _), Right (ServerReport { playerCnt = 0 })) = False
-    shouldShow (MasterArgs { showFailed = False })
-                ((_, _), Left _) = False
+    shouldShow MasterArgs { showEmpty = False }
+                (_, Right ServerReport { playerCnt = 0 }) = False
+    shouldShow MasterArgs { showFailed = False }
+                (_, Left _) = False
     shouldShow _ _ = True
-run (Single (SingleArgs { singleHost = host , singlePort = port })) = do
+run (Single SingleArgs { singleHost = host , singlePort = port }) = do
   let port' = fromIntegral port
-  report <- serverQuery host port'
-  LBS.putStrLn . encode $ Report ((host, port'), report)
+  report <- serverQuery (IP host port')
+  LBS.putStrLn . encode $ Report (IP host port', report)
 
 main :: IO ()
 main = execParser args >>= run

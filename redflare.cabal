@@ -61,10 +61,11 @@ library
   build-depends:       base >=4.8
                      , mtl >=2.2
                      , binary >=0.7
-                     , network >=2.6
+                     , network-fancy
                      , bytestring >=0.10
                      , vector >=0.10
                      , aeson >=0.8.0.2
+                     , deepseq
 
   -- Directories containing source files.
   hs-source-dirs:      src

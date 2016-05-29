@@ -8,6 +8,8 @@ module Network.RedEclipse.RedFlare
                 (serversList
                 ,serverQuery
                 ,redFlare
+                ,host
+                ,port
                 ,ServerReport(..)
                 ,Version(..)
                 ,VerInfo(..)
@@ -16,11 +18,12 @@ module Network.RedEclipse.RedFlare
                 ,MasterMode(..)
                 ,GameState(..)
                 ,Platform(..)
+                ,Address(..)
                 ,HostName
                 ,PortNumber) where
 
 import Control.Exception (bracket)
-import Control.Monad (replicateM, filterM, unless, when, zipWithM_)
+import Control.Monad (replicateM, filterM, unless, when, zipWithM_, (<$!>))
 import Control.Monad.State (State, runState, evalState, put, get, modify)
 import Data.Binary.Get
 import Data.Bits (Bits, testBit, clearBit, zeroBits)
@@ -30,8 +33,7 @@ import Data.Maybe (mapMaybe, maybe, fromJust, isNothing)
 import Data.Monoid ((<>))
 import Data.Tuple (swap)
 import Data.Word (Word8)
-import Network.Socket hiding (recv)
-import Network.Socket.ByteString (recv, sendAll)
+import Network.Fancy
 import qualified Data.ByteString as W
 import qualified Data.ByteString.Char8 as C
 import qualified Data.ByteString.Lazy as LW
@@ -39,52 +41,64 @@ import qualified Data.Vector as V
 import Data.Aeson (ToJSON(..))
 import Data.Aeson.TH (deriveToJSON, defaultOptions, Options(..))
 import System.Timeout (timeout)
+import qualified System.IO as S
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
+import Control.DeepSeq (force)
+
+type PortNumber = Int
+
+host :: Address -> HostName
+host (IP   h _) = h
+host (IPv4 h _) = h
+host (IPv6 h _) = h
+host (Unix h)   = h
+
+port :: Address -> PortNumber
+port (IP   _ p) = p
+port (IPv4 _ p) = p
+port (IPv6 _ p) = p
+port (Unix _)   = 0
+
+incPort :: Address -> Address
+incPort (IP   h p) = IP   h (p+1)
+incPort (IPv4 h p) = IPv4 h (p+1)
+incPort (IPv6 h p) = IPv6 h (p+1)
+incPort (Unix h)   = Unix h
 
 -- * Red Flare
 
 -- | Takes Red Eclipse server's hostname and port number and returns
 -- either error string or server's state report.
-serverQuery :: HostName -> PortNumber -> IO (Either String ServerReport)
-serverQuery host port = withSocket host (port+1) Datagram (((>>= parseReport) <$>) . recvReport)
+serverQuery :: Address -> IO (Either String ServerReport)
+serverQuery addr = withDgram addr (((>>= parseReport) <$>) . recvReport)
   where
-    recvReport Nothing = return (Left ("Can't connect to " ++ host ++ ":" ++ show port))
-    recvReport (Just sock) = do
-      sendAll sock (W.pack ping) -- ping id
+    recvReport sock = do
+      send sock (W.pack ping) -- ping id
       maybe (Left "Timed out on receiving report") Right <$> timeout 10000000 (recv sock enetMaxMTU)
     parseReport reportBS =
       case runGetOrFail (skip (length ping) >> getREServerReport) (LW.fromStrict reportBS) of
         Left (_, _, err) -> Left err
         Right (_, _, srv) -> Right srv
     ping = [0x02, 0x00]
+    -- | Red Eclipse uses enet library. Enet transfers data in UDP packets
+    -- of length no more than 4096.
+    enetMaxMTU = 4096
 
 -- | Takes master server's hostname and port number. Returns a list
 -- of server's connected to that master server.
-serversList :: HostName -> PortNumber -> IO [(HostName, PortNumber)]
-serversList host port = parseServersCfg <$> withSocket host port Stream getServersCfg
+serversList :: Address -> IO [Address]
+serversList addr = parseServersCfg <$> withStream addr getServersCfg
   where
-    getServersCfg Nothing = fail ("Can't connect " ++ host ++ ":" ++ show port)
-    getServersCfg (Just sock) = do
-      sendAll sock (C.pack "update\n")
-      recvAll sock
-    recvAll :: Socket -> IO W.ByteString
-    recvAll sock = do
-      mchunk <- timeout 10000000 (recv sock enetMaxMTU)
-      case mchunk of
-        Nothing -> fail "Timed out on receiving servers list"
-        Just chunk -> if W.length chunk > 0
-                        then (chunk <>) <$> recvAll sock
-                        else return W.empty
-    parseServersCfg = mapMaybe parseAddServer . filter isAddServer . lines . C.unpack
+    getServersCfg handle = do
+      C.hPut handle (C.pack "update\n")
+      S.hFlush handle
+      force <$!> C.hGetContents handle
+    parseServersCfg = mapMaybe parseAddServer . lines . C.unpack
     parseAddServer line =
-      case drop 1 (words line) of
-        (host:portString:_) ->
-          case reads portString :: [(Int, String)] of
-            [(port, _)] -> Just (host, fromIntegral port)
-            _ -> Nothing
+      case words line of
+        ("addserver":host:portString:_) -> Just $ IP host (read portString)
         _ -> Nothing
-    isAddServer = isPrefixOf "addserver"
 
 -- | Takes master server's hostname and port number, requests a list of
 -- connected servers and polls them to get their current state.
@@ -94,15 +108,10 @@ serversList host port = parseServersCfg <$> withSocket host port Stream getServe
 --
 -- This function runs `serversList`, than maps `serverQuery` over the
 -- result of `serversList` and zips results of both functions.
-redFlare :: HostName -> PortNumber -> IO [((HostName, PortNumber), Either String ServerReport)]
-redFlare host port = do
-  servers <- serversList host port
-  zip servers <$> mapConcurrently (uncurry serverQuery) servers
-
--- | Red Eclipse uses enet library. Enet transfers data in UDP packets
--- of length no more than 4096.
-enetMaxMTU :: Int
-enetMaxMTU = 4096
+redFlare :: Address -> IO [(Address, Either String ServerReport)]
+redFlare addr = do
+  servers <- serversList addr
+  zip servers <$> mapConcurrently (serverQuery . incPort) servers
 
 -- | Parse Red Eclipse's integer compression.
 getREInt :: Get Int
@@ -114,30 +123,13 @@ getREInt =  do
     _ -> return (fromIntegral w1)
 
 -- String functions
-data UncolorState = NoColor | ColorSeq | ColorBracket Char | ColorBlink Int
-  deriving Eq
-
--- | Strip Red Eclipse's color codes from string
 uncolorString :: String -> String
-uncolorString s = evalState (filterM dropColor s) NoColor
-  where
-    dropColor :: Char -> State UncolorState Bool
-    dropColor '\f' = put ColorSeq >> return False
-    dropColor '[' = dropOn ColorSeq (ColorBracket ']')
-    dropColor '(' = dropOn ColorSeq (ColorBracket ')')
-    dropColor c | c `elem` "])" = dropOn (ColorBracket c) NoColor
-    dropColor 'z' = dropOn ColorSeq (ColorBlink 2)
-    dropColor x = do s <- get
-                     case s of
-                       NoColor -> return True
-                       ColorSeq -> put NoColor >> return False
-                       ColorBlink 0 -> put NoColor >> return True
-                       ColorBlink x -> put (ColorBlink (x-1)) >> return False
-                       _ -> return False
-    dropOn s ns = do st <- get
-                     if st == s
-                       then put ns >> return False
-                       else return True
+uncolorString ('\f':'[':cs) = uncolorString . drop 1 $ dropWhile (/= ']') cs
+uncolorString ('\f':'(':cs) = uncolorString . drop 1 $ dropWhile (/= ')') cs
+uncolorString ('\f':'z':cs) = uncolorString $ drop 2 cs
+uncolorString ('\f':_  :cs) = uncolorString cs
+uncolorString (     c  :cs) = c : uncolorString cs
+uncolorString           []  = []
 
 -- | Convert byte to unicode character supported by Red Eclipse.
 wordToChar :: Word8 -> Char
@@ -356,24 +348,6 @@ getREServerReport = do
 
 -- * General utils
 
--- | A function to connect to server on specified host and port using
--- specified socket type. If connection failed function argument is
--- `Nothing` otherwise it's `(Just socket)`.
-withSocket :: HostName -> PortNumber -> SocketType -> (Maybe Socket -> IO a) -> IO a
-withSocket host port sockType = bracket conn (maybe (return ()) sClose)
-  where
-    conn = do
-      addrInfos <- getAddrInfo (Just defaultHints { addrFamily = AF_INET
-                                                  , addrSocketType = sockType })
-                               (Just host)
-                               (Just (show port))
-      case addrInfos of
-        (serverAddr:_) -> do
-          sock <- socket (addrFamily serverAddr) sockType defaultProtocol
-          connect sock (addrAddress serverAddr)
-          return (Just sock)
-        _ -> return Nothing
-
 -- | Splits bitfield of type `b` into a list of values `[a]`.
 -- Input list `[Maybe a]` is interpreted in the following way: if
 -- n-th value in a list is `Nothing` then n-th bit in the bitfield must
@@ -412,9 +386,6 @@ instance ToJSON Mutator where
   toJSON MutDefend = toJSON "Defend"
   toJSON MutGauntlet = toJSON "Gauntlet"
   toJSON mut = toJSON (show mut)
-
-instance ToJSON PortNumber where
-  toJSON p = toJSON (fromIntegral p :: Int)
 
 instance ToJSON Version where
   toJSON = toJSON . fromEnum
