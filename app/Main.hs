@@ -88,7 +88,7 @@ run (Master args) = do
     shouldShow _ _ = True
 run (Single SingleArgs { singleHost = host , singlePort = port }) = do
   let port' = fromIntegral port
-  report <- serverQuery (IP host port')
+  report <- serverQuery (IP host (port'+1))
   LBS.putStrLn . encode $ AddrReport (IP host port', report)
 
 main :: IO ()
