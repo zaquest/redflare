@@ -8,10 +8,10 @@ import Data.Aeson (encode, ToJSON(..), object, (.=))
 import Options.Applicative
 import Network.RedEclipse.RedFlare
 
-newtype Report = Report (Address, Either String ServerReport)
+newtype AddrReport = AddrReport (Address, Result Report)
 
-instance ToJSON Report where
-  toJSON (Report (addr, report)) =
+instance ToJSON AddrReport where
+  toJSON (AddrReport (addr, report)) =
     case report of
       Left err -> object [ "host"    .= host addr
                          , "port"    .= port addr
@@ -74,19 +74,22 @@ args =
 
 run :: RFArgs -> IO ()
 run (Master args) = do
-  reports <- redFlare (IP (masterHost args) (fromIntegral $ masterPort args))
-  let reports' = filter (shouldShow args) reports
-  LBS.putStrLn $ encode (map Report reports')
+  ereports <- redFlare (IP (masterHost args) (fromIntegral $ masterPort args))
+  case ereports of
+    Left err -> error err
+    Right reports -> do
+      let reports' = filter (shouldShow args) reports
+      LBS.putStrLn $ encode (map AddrReport reports')
   where
     shouldShow MasterArgs { showEmpty = False }
-                (_, Right ServerReport { playerCnt = 0 }) = False
+                (_, Right Report { playerCnt = 0 }) = False
     shouldShow MasterArgs { showFailed = False }
                 (_, Left _) = False
     shouldShow _ _ = True
 run (Single SingleArgs { singleHost = host , singlePort = port }) = do
   let port' = fromIntegral port
   report <- serverQuery (IP host port')
-  LBS.putStrLn . encode $ Report (IP host port', report)
+  LBS.putStrLn . encode $ AddrReport (IP host port', report)
 
 main :: IO ()
 main = execParser args >>= run

@@ -6,7 +6,8 @@ module Network.RedEclipse.RedFlare
                 (serversList
                 ,serverQuery
                 ,redFlare
-                ,ServerReport(..)
+                ,Result(..)
+                ,Report(..)
                 ,VerInfo(..)
                 ,Version
                 ,Mode
@@ -21,11 +22,9 @@ module Network.RedEclipse.RedFlare
                 ,PortNumber) where
 
 import Prelude hiding (take, takeWhile)
-import Control.Exception (bracket)
-import Control.Monad (replicateM, filterM, unless, when, zipWithM_, (<$!>))
+import Control.Monad (replicateM, zipWithM_, (<$!>), join)
 import Data.Bits (Bits, testBit, zeroBits, (.|.), shift)
-import Data.Either (rights, either)
-import Data.Maybe (mapMaybe, maybe, fromJust)
+import Data.Maybe (mapMaybe, maybe)
 import Data.Word (Word8)
 import Network.Fancy
 import qualified Data.ByteString as W
@@ -33,12 +32,26 @@ import qualified Data.ByteString.Char8 as C
 import qualified Data.Vector as V
 import Data.Aeson (ToJSON(..))
 import Data.Aeson.TH (deriveToJSON, defaultOptions, Options(..))
-import System.Timeout (timeout)
+import qualified System.Timeout as Timeout
 import qualified System.IO as S
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
 import Control.DeepSeq (force)
 import Data.Attoparsec.Zepto
+import Control.Exception (catch, SomeException)
+
+type Result a = Either String a
+
+timeout :: String -> Int -> IO a -> IO (Result a)
+timeout place duration action = do
+  emresult <- (Right <$> Timeout.timeout duration action) `catch` resultCatch
+  return . join $ maybe (Left $ "timeout: " ++ place) Right <$> emresult
+
+resultCatch :: Monad m => SomeException -> m (Result a)
+resultCatch = return . Left . show
+
+secs :: Int -> Int
+secs = (* 10^6)
 
 type PortNumber = Int
 
@@ -64,13 +77,14 @@ incPort (Unix h)   = Unix h
 
 -- | Takes Red Eclipse server's hostname and port number and returns
 -- either error string or server's state report.
-serverQuery :: Address -> IO (Either String ServerReport)
-serverQuery addr = withDgram addr (((>>= parseReport') <$>) . recvReport)
+serverQuery :: Address -> IO (Result Report)
+serverQuery addr = do
+  rreport <- timeout "on receiving report" (secs 10) (withDgram addr getReport)
+  return $ (W.drop (length ping) <$> rreport) >>= parse reReport
   where
-    recvReport sock = do
+    getReport sock = do
       send sock (W.pack ping) -- ping id
-      maybe (Left "Timed out on receiving report") Right <$> timeout 10000000 (recv sock enetMaxMTU)
-    parseReport' = parse parseReport . W.drop (length ping)
+      recv sock enetMaxMTU
     ping = [0x02, 0x00]
     -- | Red Eclipse uses enet library. Enet transfers data in UDP packets
     -- of length no more than 4096.
@@ -78,14 +92,16 @@ serverQuery addr = withDgram addr (((>>= parseReport') <$>) . recvReport)
 
 -- | Takes master server's hostname and port number. Returns a list
 -- of server's connected to that master server.
-serversList :: Address -> IO [Address]
-serversList addr = parseServersCfg <$> withStream addr getServersCfg
+serversList :: Address -> IO (Result [Address])
+serversList masterAddr = do
+  rcfg <- timeout "on receiving servers list" (secs 10) (withStream masterAddr getServersCfg)
+  return (parseServers <$> rcfg)
   where
     getServersCfg handle = do
       C.hPut handle (C.pack "update\n")
       S.hFlush handle
       force <$!> C.hGetContents handle
-    parseServersCfg = mapMaybe parseAddServer . lines . C.unpack
+    parseServers = mapMaybe parseAddServer . lines . C.unpack
     parseAddServer line =
       case words line of
         ("addserver":host:portString:_) -> Just $ IP host (read portString)
@@ -99,10 +115,12 @@ serversList addr = parseServersCfg <$> withStream addr getServersCfg
 --
 -- This function runs `serversList`, than maps `serverQuery` over the
 -- result of `serversList` and zips results of both functions.
-redFlare :: Address -> IO [(Address, Either String ServerReport)]
+redFlare :: Address -> IO (Result [(Address, Result Report)])
 redFlare addr = do
-  servers <- serversList addr
-  zip servers <$> mapConcurrently (serverQuery . incPort) servers
+  eservers <- serversList addr
+  case eservers of
+    Right servs -> (Right . zip servs) <$> mapConcurrently (serverQuery . incPort) servs
+    Left err    -> return (Left err)
 
 -- | Parse Red Eclipse's integer compression.
 reInt :: Parser Int
@@ -191,7 +209,7 @@ validateVersion v | v `elem` versions = return v
                   | otherwise = fail ("unknown version " ++ show v)
 
 -- | Datatype to represent current state of Red Eclipse server
-data ServerReport = ServerReport {
+data Report = Report {
   playerCnt     :: Int,             -- ^ Number of players currently connected to a server
   version       :: Version,         -- ^ Protocol's version
   gameMode      :: Mode,            -- ^ Game mode
@@ -249,8 +267,8 @@ parseIf False _ = return Nothing
 parseIf True  p = Just <$> p
 
 -- | Parse server's report.
-parseReport :: Parser ServerReport
-parseReport = do
+reReport :: Parser Report
+reReport = do
   playerCnt <- reInt
   _attrCnt <- reInt
   version <- reInt >>= validateVersion
@@ -269,7 +287,7 @@ parseReport = do
   verBranch <- parseIf (version == 229) reString
   playerNames <- map uncolorString <$> replicateM playerCnt reString
   handles <- parseIf (version /= 220) (replicateM playerCnt reString)
-  return ServerReport {..}
+  return Report {..}
 
 -- * General utils
 
@@ -286,5 +304,5 @@ mapConcurrently f as = do
         collect = mapM takeMVar
 
 -- | ToJSON instances
-deriveToJSON defaultOptions { omitNothingFields = True } ''ServerReport
+deriveToJSON defaultOptions { omitNothingFields = True } ''Report
 deriveToJSON defaultOptions { omitNothingFields = True } ''VerInfo
