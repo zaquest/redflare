@@ -1,42 +1,35 @@
 {-| This library provides functions and datatypes for getting information
   about Red Eclipse's game servers.
  -}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE RecordWildCards, TemplateHaskell #-}
 module Network.RedEclipse.RedFlare
                 (serversList
                 ,serverQuery
                 ,redFlare
+                ,ServerReport(..)
+                ,VerInfo(..)
+                ,Version
+                ,Mode
+                ,Mutator
+                ,MasterMode
+                ,GameState
+                ,Platform
+                ,Address(..)
                 ,host
                 ,port
-                ,ServerReport(..)
-                ,Version(..)
-                ,VerInfo(..)
-                ,Mode(..)
-                ,Mutator(..)
-                ,MasterMode(..)
-                ,GameState(..)
-                ,Platform(..)
-                ,Address(..)
                 ,HostName
                 ,PortNumber) where
 
+import Prelude hiding (take, takeWhile)
 import Control.Exception (bracket)
 import Control.Monad (replicateM, filterM, unless, when, zipWithM_, (<$!>))
-import Control.Monad.State (State, runState, evalState, put, get, modify)
-import Data.Binary.Get
-import Data.Bits (Bits, testBit, clearBit, zeroBits)
+import Data.Bits (Bits, testBit, zeroBits, (.|.), shift)
 import Data.Either (rights, either)
-import Data.List (isPrefixOf, dropWhileEnd, foldl1')
-import Data.Maybe (mapMaybe, maybe, fromJust, isNothing)
-import Data.Monoid ((<>))
-import Data.Tuple (swap)
+import Data.Maybe (mapMaybe, maybe, fromJust)
 import Data.Word (Word8)
 import Network.Fancy
 import qualified Data.ByteString as W
 import qualified Data.ByteString.Char8 as C
-import qualified Data.ByteString.Lazy as LW
 import qualified Data.Vector as V
 import Data.Aeson (ToJSON(..))
 import Data.Aeson.TH (deriveToJSON, defaultOptions, Options(..))
@@ -45,6 +38,7 @@ import qualified System.IO as S
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
 import Control.DeepSeq (force)
+import Data.Attoparsec.Zepto
 
 type PortNumber = Int
 
@@ -54,11 +48,11 @@ host (IPv4 h _) = h
 host (IPv6 h _) = h
 host (Unix h)   = h
 
-port :: Address -> PortNumber
-port (IP   _ p) = p
-port (IPv4 _ p) = p
-port (IPv6 _ p) = p
-port (Unix _)   = 0
+port :: Address -> Maybe PortNumber
+port (IP   _ p) = Just p
+port (IPv4 _ p) = Just p
+port (IPv6 _ p) = Just p
+port (Unix _)   = Nothing
 
 incPort :: Address -> Address
 incPort (IP   h p) = IP   h (p+1)
@@ -71,15 +65,12 @@ incPort (Unix h)   = Unix h
 -- | Takes Red Eclipse server's hostname and port number and returns
 -- either error string or server's state report.
 serverQuery :: Address -> IO (Either String ServerReport)
-serverQuery addr = withDgram addr (((>>= parseReport) <$>) . recvReport)
+serverQuery addr = withDgram addr (((>>= parseReport') <$>) . recvReport)
   where
     recvReport sock = do
       send sock (W.pack ping) -- ping id
       maybe (Left "Timed out on receiving report") Right <$> timeout 10000000 (recv sock enetMaxMTU)
-    parseReport reportBS =
-      case runGetOrFail (skip (length ping) >> getREServerReport) (LW.fromStrict reportBS) of
-        Left (_, _, err) -> Left err
-        Right (_, _, srv) -> Right srv
+    parseReport' = parse parseReport . W.drop (length ping)
     ping = [0x02, 0x00]
     -- | Red Eclipse uses enet library. Enet transfers data in UDP packets
     -- of length no more than 4096.
@@ -114,13 +105,14 @@ redFlare addr = do
   zip servers <$> mapConcurrently (serverQuery . incPort) servers
 
 -- | Parse Red Eclipse's integer compression.
-getREInt :: Get Int
-getREInt =  do
-  w1 <- getWord8
+reInt :: Parser Int
+reInt =  do
+  w1 <- W.head <$> take 1
   case w1 of
-    128 -> fromIntegral <$> getWord16le
-    129 -> fromIntegral <$> getWord32le
+    128 -> fromLE <$> take 2
+    129 -> fromLE <$> take 4
     _ -> return (fromIntegral w1)
+  where fromLE = foldr1 (.|.) . zipWith (flip shift) [0,8..] . map fromIntegral . W.unpack
 
 -- String functions
 uncolorString :: String -> String
@@ -156,40 +148,20 @@ cube2UniChars = V.fromList $ map toEnum [
     0x43F, 0x442, 0x444, 0x446, 0x447, 0x448, 0x449, 0x44A, 0x44B, 0x44C, 0x44D, 0x44E, 0x44F, 0x454, 0x490, 0x491 ]
 
 -- | Parse Red Eclipse's string into Haskell's string.
-getREString :: Get String
-getREString = (map wordToChar . LW.unpack) <$> getLazyByteStringNul
+reString :: Parser String
+reString = (map wordToChar . W.unpack) <$> (takeWhile (/= 0) <* take 1)
 
--- | Parse enum type `a` from Red Eclipse's integer. `name` is enum's name
--- used for error reporting.
-getREEnum :: forall a. (Enum a, Bounded a) => String -> Get a
-getREEnum name = do
-  num <- getREInt
-  if num `elem` map fromEnum (enumFrom minBound :: [a])
-    then return (toEnum num)
-    else fail ("Unknown " ++ name ++ " " ++ show num)
+-- | Parse value's index in `xs` list from input stream
+oneOf :: String -> [a] -> Parser a
+oneOf what xs = do
+  idx <- reInt
+  case drop idx xs of
+    (x:_) -> return x
+    []    -> fail (what ++ " is out of range " ++ show idx)
 
--- | Datatype to represent Red Eclipse's protocol version
-data Version = V220 | V226 | V229
-  deriving (Show, Read, Eq, Ord)
-
-tableVersion :: [(Version, Int)]
-tableVersion = [(V220, 220), (V226, 226), (V229, 229)]
-
-instance Enum Version where
-  fromEnum = fromJust . flip lookup tableVersion
-  toEnum = fromJust . flip lookup (map swap tableVersion)
-  succ = head . tail . enumFrom
-  pred v = last . init $ dropWhileEnd (/= v) (map fst tableVersion)
-  enumFrom v = dropWhile (/= v) (map fst tableVersion)
-  enumFromTo v v' = dropWhileEnd (/= v') (enumFrom v)
-
-instance Bounded Version where
-  minBound = V220
-  maxBound = V229
-
--- | Parse protocol's version number.
-getREVersion :: Get Version
-getREVersion = getREEnum "Red Eclipse version"
+-- | Parse bit mask from input stream and apply it to `xs` list
+listOf :: [a] -> Parser [a]
+listOf xs = map fst . filter snd . zip xs . bits <$> reInt
 
 -- | Datatype to represent Red Eclipse server's version information.
 data VerInfo = VerInfo {
@@ -200,20 +172,23 @@ data VerInfo = VerInfo {
   versionArch     :: Int       -- ^ Architecture for which Red Eclipse was compiled
 } deriving (Show, Read)
 
--- | Datatype to represent platform
-data Platform = Win | OSX | LinuxBSD
-  deriving (Show, Read, Enum, Bounded)
+type Platform = String
+platforms = ["Win", "OSX", "Linux/BSD"]
 
 -- | Parse Red Eclipse server's version info
-getREVerInfo :: Get VerInfo
-getREVerInfo = VerInfo <$> getREInt
-                       <*> getREInt
-                       <*> getREInt
-                       <*> getREPlatform
-                       <*> getREInt
+reVerInfo :: Parser VerInfo
+reVerInfo = VerInfo <$> reInt
+                    <*> reInt
+                    <*> reInt
+                    <*> oneOf "platform" platforms
+                    <*> reInt
 
-getREPlatform :: Get Platform
-getREPlatform = getREEnum "platform"
+type Version = Int
+versions = [220, 226, 229]
+
+validateVersion :: Version -> Parser Version
+validateVersion v | v `elem` versions = return v
+                  | otherwise = fail ("unknown version " ++ show v)
 
 -- | Datatype to represent current state of Red Eclipse server
 data ServerReport = ServerReport {
@@ -237,129 +212,66 @@ data ServerReport = ServerReport {
                                     -- as `playerNames`. If player is not authenticated the handle is empty string.
 } deriving (Show, Read)
 
--- | Game mode.
-data Mode = Demo | Edit | Deathmatch | Capture | Defend | Bomber | Race | Gauntlet
-  deriving (Show, Eq, Ord, Enum, Read, Bounded)
-
--- | Parse game mode.
--- Currently the version is not needed. The only caveat of ignoring version
--- is that in case of an error there might appear `Gauntlet` in 1.5 protocol.
-getREMode :: Version -> Get Mode
-getREMode _ = getREEnum "game mode"
+type Mode = String
+modes = ["demo", "edit", "deathmatch", "capture-the-flag", "defend-and-control", "bomber-ball", "race", "gauntlet"]
 
 -- | Game mutator.
-data Mutator = Multi   | FFA       | Coop        | Insta     | Medieval
-             | Kaboom  | Duel      | Survivor    | Classic   | OnSlaught
-             | Jetpack | Freestyle | Vampire     | Expert    | Resize
-             | Hard    | Basic     | Quick       | MutDefend | Protect
-             | King    | Hold      | Basket      | Touchdown | Attack
-             | Timed   | Endurance | MutGauntlet | Gladiator | OldSchool
-  deriving (Show, Read, Eq)
+type Mutator = String
 
--- | Returns a list of available mutators for the given version and game mode.
--- Mutators are ordered in Red Eclipse's enum order. If n-th mutator
--- in Red Eclipse's order is not available in given mode and version
--- then `Nothing` is put in on n-th position in output list.
-verModeMuts :: Version -> Mode -> [Maybe Mutator]
-verModeMuts V220 Edit       = [FFA, Classic, Jetpack] `from` allMuts V220
-verModeMuts v    Edit       = [FFA, Classic, Freestyle] `from` allMuts v
-verModeMuts V229 Deathmatch = allow $ allMuts V229 ++ [Gladiator, OldSchool]
-verModeMuts v    Deathmatch = allow (allMuts v)
-verModeMuts v    Capture    = allMuts v `but` [FFA] ++ allow [Quick, MutDefend, Protect]
-verModeMuts v    Defend     = allMuts v `but` [FFA, Duel, Survivor] ++ allow [Quick, King]
-verModeMuts V220 Bomber     = allMuts V220 `but` [FFA] ++ allow [Hold, Touchdown]
-verModeMuts v    Bomber     = allMuts v `but` [FFA] ++ allow [Hold, Basket, Attack]
-verModeMuts V220 Race       = allMuts V220 `but` [Multi, Coop, Duel, Survivor]
-verModeMuts v    Race       = [Multi, FFA, OnSlaught, Freestyle] `from` allMuts v ++ allow [Timed, Endurance, MutGauntlet]
-verModeMuts V220 Gauntlet   = allMuts V220 `but` [Multi, FFA, Coop, Survivor] ++ allow [Timed, Hard]
-verModeMuts _    Gauntlet   = []
+versionMuts :: Version -> [Mutator]
+versionMuts 220 = ["multi", "ffa", "coop", "insta", "medieval", "kaboom", "duel", "survivor", "classic", "onslaught", "jetpack", "vampire", "expert", "resize"]
+versionMuts _   = ["multi", "ffa", "coop", "insta", "medieval", "kaboom", "duel", "survivor", "classic", "onslaught", "freestyle", "vampire", "resize", "hard", "basic"]
 
-allMuts V220 = [Multi, FFA, Coop, Insta, Medieval, Kaboom, Duel, Survivor, Classic, OnSlaught, Jetpack, Vampire, Expert, Resize]
-allMuts _    = [Multi, FFA, Coop, Insta, Medieval, Kaboom, Duel, Survivor, Classic, OnSlaught, Freestyle, Vampire, Resize, Hard, Basic]
-ys `from` xs = map (\x -> if x `elem` ys then Just x else Nothing) xs
-xs `but`  ys = map (\x -> if x `elem` ys then Nothing else Just x) xs
-allow = map Just
+gameSpecificMuts :: Version -> Mode -> [Mutator]
+gameSpecificMuts 229 "deathmatch"         = ["gladiator", "oldschool"]
+gameSpecificMuts _   "capture-the-flag"   = ["quick", "defend", "protect"]
+gameSpecificMuts _   "defend-and-control" = ["quick", "king"]
+gameSpecificMuts 220 "bomber-ball"        = ["hold", "touchdown"]
+gameSpecificMuts _   "bomber-ball"        = ["hold", "basket", "attack"]
+gameSpecificMuts 220 "race"               = ["timed", "endurance", "gauntlet"]
+gameSpecificMuts 220 "gauntlet"           = ["timed", "hard"]
+gameSpecificMuts _   _                    = []
 
-getREMutators :: Version -> Mode -> Get [Mutator]
-getREMutators version mode = do
-  num <- getREInt
-  let emuts = bitsToList (verModeMuts version mode) num
-  either (fail' num) return emuts
-  where
-    fail' num _ = fail ("Malformed mutator code " ++ show num ++ " for " ++ show mode ++ " in protocol " ++ show version)
+mutatorsOf :: Version -> Mode -> [Mutator]
+mutatorsOf version mode = versionMuts version ++ gameSpecificMuts version mode
 
--- | Master mode.
-data MasterMode = Open | Veto | Locked | Private | Password
-  deriving (Show, Read, Enum, Bounded)
+type MasterMode = String
+masterModes = ["open", "veto", "locked", "private", "password"]
 
--- | Parse master mode.
-getREMasterMode :: Get MasterMode
-getREMasterMode = getREEnum "master mode"
+type GameState = String
+gameStates :: Version -> [GameState]
+gameStates 226 = ["waiting", "voting", "intermission", "playing", "overtime"]
+gameStates 229 = ["waiting", "get-map", "send-map", "readying", "game-info", "playing", "overtime", "intermission", "voting"]
+gameStates _   = []
 
--- | Datatype to represent game state.
-data GameState = Waiting | GetMap | SendMap | Readying | GameInfo | Playing | Overtime | Intermission | Voting
-  deriving (Show, Read, Enum, Bounded)
-
--- | Parse game state.
-getREGameState :: Version -> Get GameState
-getREGameState V220 = fail "V220 does not support game state"
-getREGameState v = do
-  idx <- getREInt
-  when (idx < 0) (fail' idx)
-  case drop idx states of
-    (gs:_) -> return gs
-    []     -> fail' idx
-  where
-    states = case v of
-               V220 -> error ("Unsupported protocol version " ++ show v)
-               V226 -> [Waiting, Voting, Intermission, Playing, Overtime]
-               V229 -> enumFrom Waiting
-    fail' idx = fail ("Bad game state " ++ show idx ++ " in protocol version " ++ show v)
+parseIf :: Bool -> Parser a -> Parser (Maybe a)
+parseIf False _ = return Nothing
+parseIf True  p = Just <$> p
 
 -- | Parse server's report.
-getREServerReport :: Get ServerReport
-getREServerReport = do
-  playerCnt <- getREInt
-  _attrCnt <- getREInt
-  version <- getREVersion
-  gameMode <- getREMode version
-  mutators <- getREMutators version gameMode
-  timeRemaining <- getREInt
-  serverClients <- getREInt
-  masterMode <- getREMasterMode
-  numGameVars <- getREInt
-  numGameMods <- getREInt
-  (verInfo, gameState, timeLeft) <- case version of
-      V220 -> return (Nothing, Nothing, Nothing)
-      _ -> (,,) <$> (Just <$> getREVerInfo)
-                <*> (Just <$> getREGameState version)
-                <*> (Just <$> getREInt)
-  mapName <- getREString
-  serverDesc <- uncolorString <$> getREString
-  verBranch <- case version of
-    V220 -> return Nothing
-    V226 -> return Nothing
-    V229 -> Just <$> getREString
-  playerNames <- map uncolorString <$> replicateM playerCnt getREString
-  handles <- case version of
-    V220 -> return Nothing
-    _ -> Just <$> replicateM playerCnt getREString
+parseReport :: Parser ServerReport
+parseReport = do
+  playerCnt <- reInt
+  _attrCnt <- reInt
+  version <- reInt >>= validateVersion
+  gameMode <- oneOf "mode" modes
+  mutators <- listOf (mutatorsOf version gameMode)
+  timeRemaining <- reInt
+  serverClients <- reInt
+  masterMode <- oneOf "master mode" masterModes
+  numGameVars <- reInt
+  numGameMods <- reInt
+  verInfo <- parseIf (version /= 220) reVerInfo
+  gameState <- parseIf (version /= 220) (oneOf "game state" (gameStates version))
+  timeLeft <- parseIf (version /= 220) reInt
+  mapName <- reString
+  serverDesc <- uncolorString <$> reString
+  verBranch <- parseIf (version == 229) reString
+  playerNames <- map uncolorString <$> replicateM playerCnt reString
+  handles <- parseIf (version /= 220) (replicateM playerCnt reString)
   return ServerReport {..}
 
 -- * General utils
-
--- | Splits bitfield of type `b` into a list of values `[a]`.
--- Input list `[Maybe a]` is interpreted in the following way: if
--- n-th value in a list is `Nothing` then n-th bit in the bitfield must
--- be `0` else fail. `Just` values are unwrapped. If n-th bit is set
--- in the bitfield and the length of the input list is `<= n` then fail.
-bitsToList :: Bits b => [Maybe a] -> b -> Either String [a]
-bitsToList xs b = if leftover == zeroBits
-                    then Right (map (\(_, Just m, _) -> m) muts)
-                    else Left "Malformed enum code"
-  where
-    (muts, leftover) = runState (filterM removeCode (zip3 (bits b) xs [0..])) b
-    removeCode (b, ma, n) = unless (isNothing ma) (modify (`clearBit` n)) >> return b
 
 -- | Returns a bits of `b` as a list of `Bool` values.
 bits :: Bits b => b -> [Bool]
@@ -370,22 +282,9 @@ mapConcurrently f as = do
   vars <- mapM (const newEmptyMVar) as
   zipWithM_ inOwnThread vars as
   collect vars
-  where
-    inOwnThread v a = forkIO $ f a >>= putMVar v
-    collect = mapM takeMVar
+  where inOwnThread v a = forkIO $ f a >>= putMVar v
+        collect = mapM takeMVar
 
 -- | ToJSON instances
 deriveToJSON defaultOptions { omitNothingFields = True } ''ServerReport
 deriveToJSON defaultOptions { omitNothingFields = True } ''VerInfo
-deriveToJSON defaultOptions { omitNothingFields = True } ''Mode
-deriveToJSON defaultOptions { omitNothingFields = True } ''MasterMode
-deriveToJSON defaultOptions { omitNothingFields = True } ''GameState
-deriveToJSON defaultOptions { omitNothingFields = True } ''Platform
-
-instance ToJSON Mutator where
-  toJSON MutDefend = toJSON "Defend"
-  toJSON MutGauntlet = toJSON "Gauntlet"
-  toJSON mut = toJSON (show mut)
-
-instance ToJSON Version where
-  toJSON = toJSON . fromEnum

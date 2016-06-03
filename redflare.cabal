@@ -60,7 +60,7 @@ library
   -- Other library packages from which modules are imported.
   build-depends:       base >=4.8
                      , mtl >=2.2
-                     , binary >=0.7
+                     , attoparsec
                      , network-fancy
                      , bytestring >=0.10
                      , vector >=0.10
