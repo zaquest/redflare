@@ -202,7 +202,7 @@ reVerInfo = VerInfo <$> reInt
                     <*> reInt
 
 type Version = Int
-versions = [220, 226, 229]
+versions = [220, 226, 229, 230]
 
 validateVersion :: Version -> Parser Version
 validateVersion v | v `elem` versions = return v
@@ -241,7 +241,7 @@ versionMuts 220 = ["multi", "ffa", "coop", "insta", "medieval", "kaboom", "duel"
 versionMuts _   = ["multi", "ffa", "coop", "insta", "medieval", "kaboom", "duel", "survivor", "classic", "onslaught", "freestyle", "vampire", "resize", "hard", "basic"]
 
 gameSpecificMuts :: Version -> Mode -> [Mutator]
-gameSpecificMuts 229 "deathmatch"         = ["gladiator", "oldschool"]
+gameSpecificMuts n   "deathmatch" | n `elem` [229, 230] = ["gladiator", "oldschool"]
 gameSpecificMuts _   "capture-the-flag"   = ["quick", "defend", "protect"]
 gameSpecificMuts _   "defend-and-control" = ["quick", "king"]
 gameSpecificMuts 220 "bomber-ball"        = ["hold", "touchdown"]
@@ -259,7 +259,7 @@ masterModes = ["open", "veto", "locked", "private", "password"]
 type GameState = String
 gameStates :: Version -> [GameState]
 gameStates 226 = ["waiting", "voting", "intermission", "playing", "overtime"]
-gameStates 229 = ["waiting", "get-map", "send-map", "readying", "game-info", "playing", "overtime", "intermission", "voting"]
+gameStates n | n `elem` [229, 230] = ["waiting", "get-map", "send-map", "readying", "game-info", "playing", "overtime", "intermission", "voting"]
 gameStates _   = []
 
 parseIf :: Bool -> Parser a -> Parser (Maybe a)
@@ -284,7 +284,7 @@ reReport = do
   timeLeft <- parseIf (version /= 220) reInt
   mapName <- reString
   serverDesc <- uncolorString <$> reString
-  verBranch <- parseIf (version == 229) reString
+  verBranch <- parseIf (version `elem` [229, 230]) reString
   playerNames <- map uncolorString <$> replicateM playerCnt reString
   handles <- parseIf (version /= 220) (replicateM playerCnt reString)
   return Report {..}
