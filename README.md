@@ -1,11 +1,12 @@
-#Red Eclipse Server Browser
+# Red Eclipse Server Browser
 
 This package contains library and executable to access current state of [Red Eclipse](http://redeclipse.net)'s game servers.
 The name was shamelessly stolen from [Redflare](http://redflare.ofthings.net/).
 
 Note: neither the library nor the executable access original [Redflare](http://redflare.ofthings.net/).
 
-##Usage
+## Usage
+
 ```
 > redflare --help
 Usage: redflare COMMAND
@@ -20,7 +21,8 @@ Available commands:
     single                   Get current state of a specified server.
 ```
 
-###Master Command
+### Master Command
+
 ```
 > redflare master --help
 Usage: redflare master [HOST] [PORT] [-e|--show-empty] [-f|--show-failed]
@@ -80,7 +82,8 @@ Available options:
  ,"port":28810}]
 ```
 
-###Single Command
+### Single Command
+
 ```
 > redflare single --help
 Usage: redflare single HOST [PORT]

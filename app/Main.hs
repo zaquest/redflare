@@ -6,6 +6,7 @@ import Data.Text (Text)
 import Data.Word (Word16)
 import Data.Aeson (encode, ToJSON(..), object, (.=))
 import Options.Applicative
+import Data.Semigroup ((<>))
 import Network.RedEclipse.RedFlare
 
 newtype AddrReport = AddrReport (Address, Result Report)
