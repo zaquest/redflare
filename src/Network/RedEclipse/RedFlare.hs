@@ -98,7 +98,7 @@ serversList masterAddr = do
   return (parseServers <$> rcfg)
   where
     getServersCfg handle = do
-      C.hPut handle (C.pack "update\n")
+      C.hPut handle (C.pack "list\n")
       S.hFlush handle
       force <$!> C.hGetContents handle
     parseServers = mapMaybe parseAddServer . lines . C.unpack

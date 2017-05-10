@@ -20,7 +20,7 @@ synopsis:            Library to be used for browsing Red Eclipse's game servers.
 -- description:
 
 -- The license under which the package is released.
--- license:
+license:             MIT
 
 -- The file containing the license text.
 license-file:        LICENSE
