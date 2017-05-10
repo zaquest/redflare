@@ -19,7 +19,8 @@ module Network.RedEclipse.RedFlare
                 ,host
                 ,port
                 ,HostName
-                ,PortNumber) where
+                ,PortNumber
+                ,mapConcurrently) where
 
 import Prelude hiding (take, takeWhile)
 import Control.Monad (replicateM, zipWithM_, (<$!>), join)
